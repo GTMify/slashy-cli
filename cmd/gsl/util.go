@@ -12,11 +12,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 )
 
 // newFlagSet returns a flag set that reports errors through the normal error
@@ -25,6 +27,63 @@ func newFlagSet(name string) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	return fs
+}
+
+// parseWithLeadingName pulls a leading positional argument off the front before
+// handing the rest to the flag set, then falls back to the first remaining
+// positional if the name came after the flags.
+//
+// This exists because Go's flag package stops parsing at the FIRST
+// non-flag argument. Without it, `gsl call draft_email -a to=x` parses zero
+// flags: "draft_email" halts the parser and every -a is left in fs.Args(). The
+// failure is quiet and looks like a server-side problem, since the call then
+// reports the required arguments missing even though they were supplied.
+func parseWithLeadingName(fs *flag.FlagSet, args []string) (string, error) {
+	name, rest := extractName(fs, args)
+	if err := fs.Parse(rest); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// extractName finds the first bare positional argument and returns it along
+// with the remaining arguments, so the flag set never sees the token that would
+// halt it. Flags may appear on either side of the name.
+//
+// It has to know which flags consume a following value, or `-a to=x draft_email`
+// would mistake "to=x" for the tool name. Boolean flags advertise themselves
+// through IsBoolFlag, which is how the flag package itself decides this.
+func extractName(fs *flag.FlagSet, args []string) (string, []string) {
+	isBool := func(n string) bool {
+		f := fs.Lookup(n)
+		if f == nil {
+			return false
+		}
+		b, ok := f.Value.(interface{ IsBoolFlag() bool })
+		return ok && b.IsBoolFlag()
+	}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--": // everything after this is positional
+			if i+1 < len(args) {
+				return args[i+1], append(args[:i:i], args[i+2:]...)
+			}
+			return "", args[:i:i]
+		case strings.HasPrefix(a, "-") && a != "-":
+			flagName := strings.TrimLeft(a, "-")
+			if strings.Contains(flagName, "=") {
+				continue // -flag=value carries its own value
+			}
+			if !isBool(flagName) {
+				i++ // the next token is this flag's value, not the name
+			}
+		default:
+			// The three-index slice keeps the copy from aliasing args.
+			return a, append(args[:i:i], args[i+1:]...)
+		}
+	}
+	return "", args
 }
 
 // argList collects a repeated flag (-a key=value -a key2=value2).
@@ -227,23 +286,150 @@ func dedupe(in []string) []string {
 
 // ---------- output ----------
 
-// printToolResult prints the human summary. MCP servers usually return text
-// content already written for an agent, so passing it through beats re-rendering.
+// Bounds on the default (non---json) rendering. The whole reason to prefer a
+// CLI over a connected MCP server is that the heavy payload stays out of the
+// caller's context, so an unbounded passthrough would give that away. Measured
+// case: draft_email returns 180KB, nearly all of it a base64 signature image.
+const (
+	inlineJSONLimit = 900  // JSON at or under this prints in full
+	plainTextLimit  = 4000 // prose is passed through up to here
+	fieldValueLimit = 96   // per-field cap inside a digest
+)
+
+// printToolResult prints the human summary. Slashy's tools mostly return a JSON
+// document as content[0].text, so a digest of the top level beats both dumping
+// it and hiding it. `--json` remains the way to get everything.
 func printToolResult(tr *toolResult) {
 	printed := false
 	for _, c := range tr.Content {
 		if c.Text != "" {
-			fmt.Println(strings.TrimRight(c.Text, "\n"))
+			printSummary(c.Text)
 			printed = true
 		}
 	}
 	if !printed && len(tr.StructuredContent) > 0 {
-		_ = printRaw(tr.StructuredContent)
+		printSummary(string(tr.StructuredContent))
 		printed = true
 	}
 	if !printed {
 		fmt.Println("(the tool returned no content)")
 	}
+}
+
+func printSummary(text string) {
+	trimmed := strings.TrimSpace(text)
+	var v any
+	if err := json.Unmarshal([]byte(trimmed), &v); err != nil {
+		// Prose, which is already written for a reader. Pass it through, capped.
+		if len(trimmed) <= plainTextLimit {
+			fmt.Println(strings.TrimRight(trimmed, "\n"))
+			return
+		}
+		fmt.Println(strings.TrimRight(trimmed[:plainTextLimit], "\n"))
+		fmt.Printf("\n... truncated, %s total. Add --json for all of it.\n", byteCount(len(trimmed)))
+		return
+	}
+	if len(trimmed) <= inlineJSONLimit {
+		_ = printJSON(v) // small enough to be worth showing whole
+		return
+	}
+	digest(v)
+	fmt.Printf("\n(%s payload digested. Add --json for the full result.)\n", byteCount(len(trimmed)))
+}
+
+// digest prints one line per top-level field, with a compact stand-in for any
+// value too large to show.
+func digest(v any) {
+	switch t := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		for _, k := range keys {
+			fmt.Fprintf(w, "  %s\t%s\n", k, compactValue(t[k]))
+		}
+		w.Flush()
+	case []any:
+		fmt.Printf("  [%d items]\n", len(t))
+		for i, item := range t {
+			if i >= 5 {
+				fmt.Printf("  ... and %d more\n", len(t)-5)
+				break
+			}
+			fmt.Printf("  %d. %s\n", i+1, compactValue(item))
+		}
+	default:
+		fmt.Println("  " + compactValue(v))
+	}
+}
+
+func compactValue(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return "null"
+	case string:
+		s := strings.TrimSpace(strings.ReplaceAll(t, "\n", " "))
+		if len(s) <= fieldValueLimit {
+			return s
+		}
+		return fmt.Sprintf("%s... (%s)", s[:fieldValueLimit-3], byteCount(len(t)))
+	case bool:
+		return fmt.Sprint(t)
+	case float64:
+		// JSON numbers decode to float64, so an id like 95792250 would otherwise
+		// print as 9.579225e+07 and be useless to copy.
+		if t == math.Trunc(t) && math.Abs(t) < 1e15 {
+			return strconv.FormatInt(int64(t), 10)
+		}
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case []any:
+		if len(t) == 0 {
+			return "[]"
+		}
+		// A short list of scalars is more useful shown than counted.
+		if len(t) <= 3 {
+			parts := make([]string, 0, len(t))
+			simple := true
+			for _, x := range t {
+				switch x.(type) {
+				case map[string]any, []any:
+					simple = false
+				}
+				if !simple {
+					break
+				}
+				parts = append(parts, compactValue(x))
+			}
+			if simple {
+				return "[" + strings.Join(parts, ", ") + "]"
+			}
+		}
+		return fmt.Sprintf("[%d items]", len(t))
+	case map[string]any:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		if len(keys) > 6 {
+			return fmt.Sprintf("{%d fields: %s, ...}", len(keys), strings.Join(keys[:6], ", "))
+		}
+		return fmt.Sprintf("{%s}", strings.Join(keys, ", "))
+	}
+	return fmt.Sprint(v)
+}
+
+func byteCount(n int) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1fMB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1fKB", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%dB", n)
 }
 
 func printJSON(v any) error {

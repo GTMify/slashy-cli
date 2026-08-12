@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -66,6 +67,86 @@ func TestBindLoopbackPortsAreDistinct(t *testing.T) {
 	defer b.Close()
 	if uriA == uriB {
 		t.Errorf("two listeners share the redirect URI %s", uriA)
+	}
+}
+
+// Go's flag package stops parsing at the first non-flag argument, so
+// `gsl call draft_email -a to=x` parsed ZERO flags until this was fixed: the
+// tool name halted the parser and every -a was left in fs.Args(). The call then
+// reported its required arguments missing even though they were supplied, which
+// reads like a server problem rather than a parsing one.
+func TestParseWithLeadingName(t *testing.T) {
+	cases := []struct {
+		desc     string
+		argv     []string
+		wantName string
+		wantArgs []string
+		wantJSON bool
+	}{
+		{"name first, then flags", []string{"draft_email", "-a", "to=x", "-a", "subject=hi"},
+			"draft_email", []string{"to=x", "subject=hi"}, false},
+		{"bool flag first, then name", []string{"--json", "draft_email", "-a", "to=x"},
+			"draft_email", []string{"to=x"}, true},
+		// The value-carrying flag must not have its value mistaken for the name.
+		{"value flag before the name", []string{"-a", "to=x", "draft_email", "-a", "subject=hi"},
+			"draft_email", []string{"to=x", "subject=hi"}, false},
+		{"joined flag syntax", []string{"-a=to=x", "draft_email"},
+			"draft_email", []string{"to=x"}, false},
+		{"flags on both sides", []string{"--json", "-a", "to=x", "draft_email", "-a", "subject=hi"},
+			"draft_email", []string{"to=x", "subject=hi"}, true},
+		{"name only", []string{"get_user_info"}, "get_user_info", nil, false},
+		{"nothing", nil, "", nil, false},
+		{"flags but no name", []string{"--json"}, "", nil, true},
+	}
+	for _, c := range cases {
+		fs := newFlagSet("call")
+		var kv argList
+		fs.Var(&kv, "a", "")
+		asJSON := fs.Bool("json", false, "")
+
+		name, err := parseWithLeadingName(fs, c.argv)
+		if err != nil {
+			t.Fatalf("%s: %v", c.desc, err)
+		}
+		if name != c.wantName {
+			t.Errorf("%s: name = %q, want %q", c.desc, name, c.wantName)
+		}
+		if !reflect.DeepEqual([]string(kv), c.wantArgs) {
+			t.Errorf("%s: -a flags = %v, want %v", c.desc, []string(kv), c.wantArgs)
+		}
+		if *asJSON != c.wantJSON {
+			t.Errorf("%s: --json = %v, want %v", c.desc, *asJSON, c.wantJSON)
+		}
+	}
+}
+
+// The end-to-end shape the bug actually broke: every supplied argument must
+// survive parsing and satisfy the schema.
+func TestArgsSurviveParsingIntoValidation(t *testing.T) {
+	fs := newFlagSet("call")
+	var kv argList
+	fs.Var(&kv, "a", "")
+	name, err := parseWithLeadingName(fs, []string{
+		"draft_email", "-a", "inbox_email=a@b.com", "-a", "subject=hi",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "draft_email" {
+		t.Fatalf("name = %q", name)
+	}
+	args := map[string]any{}
+	for _, pair := range kv {
+		k, v, perr := splitPair(pair)
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		args[k] = coerce(v)
+	}
+	tool := &Tool{Name: "draft_email", InputSchema: json.RawMessage(
+		`{"type":"object","properties":{"inbox_email":{"type":"string"},"subject":{"type":"string"}},"required":["inbox_email"]}`)}
+	if err := validateArgs(tool, args); err != nil {
+		t.Errorf("arguments supplied on the command line failed validation: %v", err)
 	}
 }
 
@@ -371,6 +452,94 @@ func TestPKCEPairIsVerifiable(t *testing.T) {
 	if v == v2 {
 		t.Error("each login must use a fresh verifier")
 	}
+}
+
+// The digest is what keeps a call cheap. Measured case: draft_email returns
+// 185KB, almost all of it a base64 signature image, and an unbounded
+// passthrough would put every byte in the caller's context.
+func TestCompactValue(t *testing.T) {
+	cases := []struct {
+		in   any
+		want string
+	}{
+		{nil, "null"},
+		{true, "true"},
+		// JSON numbers arrive as float64; an id must not print as 9.579225e+07.
+		{float64(95792250), "95792250"},
+		{float64(1.5), "1.5"},
+		{"short", "short"},
+		{[]any{}, "[]"},
+		{[]any{"a", "b"}, "[a, b]"},
+		{[]any{map[string]any{"x": 1}}, "[1 items]"},
+		{map[string]any{"b": 1, "a": 2}, "{a, b}"},
+	}
+	for _, c := range cases {
+		if got := compactValue(c.in); got != c.want {
+			t.Errorf("compactValue(%#v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	// A long string is truncated and reports its true size.
+	long := compactValue(strings.Repeat("x", 5000))
+	if len(long) > fieldValueLimit+20 {
+		t.Errorf("long string rendered %d chars, should be capped near %d", len(long), fieldValueLimit)
+	}
+	if !strings.Contains(long, "4.9KB") {
+		t.Errorf("truncated value should report the real size, got %q", long)
+	}
+	// Multi-line values must not break the one-line-per-field layout.
+	if got := compactValue("a\nb"); strings.Contains(got, "\n") {
+		t.Errorf("newlines should be flattened, got %q", got)
+	}
+}
+
+func TestByteCount(t *testing.T) {
+	cases := map[int]string{0: "0B", 512: "512B", 1536: "1.5KB", 2 << 20: "2.0MB"}
+	for in, want := range cases {
+		if got := byteCount(in); got != want {
+			t.Errorf("byteCount(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestPrintSummaryBoundsOutput(t *testing.T) {
+	// A big JSON document must be digested, not dumped.
+	big := map[string]any{"success": true, "body_html": strings.Repeat("z", 180_000)}
+	raw, _ := json.Marshal(big)
+	out := captureStdout(func() { printSummary(string(raw)) })
+	if len(out) > 2000 {
+		t.Errorf("a %s payload rendered %d bytes; the digest is not bounding it", byteCount(len(raw)), len(out))
+	}
+	for _, want := range []string{"success", "body_html", "--json"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("digest should mention %q, got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, strings.Repeat("z", 200)) {
+		t.Error("the digest leaked the full field value")
+	}
+
+	// Small JSON is more useful shown whole.
+	small := captureStdout(func() { printSummary(`{"ok":true,"id":"abc"}`) })
+	if !strings.Contains(small, `"ok": true`) {
+		t.Errorf("small JSON should print in full, got:\n%s", small)
+	}
+
+	// Prose is passed through untouched.
+	prose := captureStdout(func() { printSummary("Draft created successfully.") })
+	if strings.TrimSpace(prose) != "Draft created successfully." {
+		t.Errorf("prose should pass through, got %q", prose)
+	}
+}
+
+func captureStdout(fn func()) string {
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	fn()
+	w.Close()
+	os.Stdout = old
+	b, _ := io.ReadAll(r)
+	return string(b)
 }
 
 func TestFirstLineTruncates(t *testing.T) {

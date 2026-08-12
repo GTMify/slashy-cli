@@ -287,13 +287,13 @@ func cmdTools(ctx context.Context, args []string) error {
 func cmdSchema(ctx context.Context, args []string) error {
 	fs := newFlagSet("schema")
 	asJSON := fs.Bool("json", false, "raw JSON schema")
-	if err := fs.Parse(args); err != nil {
+	name, err := parseWithLeadingName(fs, args)
+	if err != nil {
 		return err
 	}
-	if fs.NArg() < 1 {
+	if name == "" {
 		return errors.New("usage: gsl schema <tool>")
 	}
-	name := fs.Arg(0)
 	tools, err := fetchTools(ctx)
 	if err != nil {
 		return err
@@ -349,13 +349,13 @@ func cmdCall(ctx context.Context, args []string) error {
 	rawArgs := fs.String("args", "", "whole argument object as JSON")
 	asJSON := fs.Bool("json", false, "raw JSON result")
 	dryRun := fs.Bool("dry-run", false, "validate against the schema and stop")
-	if err := fs.Parse(args); err != nil {
+	name, err := parseWithLeadingName(fs, args)
+	if err != nil {
 		return err
 	}
-	if fs.NArg() < 1 {
+	if name == "" {
 		return errors.New("usage: gsl call <tool> [-a key=value]...  (`gsl tools` to list)")
 	}
-	name := fs.Arg(0)
 
 	toolArgs := map[string]any{}
 	if *rawArgs != "" {
