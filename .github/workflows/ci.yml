@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Build
+        run: go build ./...
+
+  # The tests above need no network and no credentials. This job proves the
+  # binary runs and its unauthenticated error paths behave, which is the part a
+  # broken refactor would take out first.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Build binary
+        run: go build -o gsl ./cmd/gsl
+
+      - name: Version and help
+        run: |
+          ./gsl version
+          ./gsl help
+
+      - name: Unauthenticated commands fail cleanly
+        env:
+          GSL_CONFIG_DIR: /tmp/gsl-ci-empty
+        run: |
+          set +e
+          out=$(./gsl whoami 2>&1); code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -eq 0 ]; then
+            echo "expected a non-zero exit without credentials"; exit 1
+          fi
+          case "$out" in
+            *"gsl login"*) ;;
+            *) echo "error should point the user at 'gsl login'"; exit 1 ;;
+          esac
