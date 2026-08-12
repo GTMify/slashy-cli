@@ -3,12 +3,71 @@ package main
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+// The --redirect-host escape hatch is only useful if the listener binds the same
+// host that goes into the redirect URI. Binding 127.0.0.1 while redirecting to
+// "localhost" fails on macOS, where localhost resolves to ::1 first, and that
+// failure only surfaces against a server that rejects the 127.0.0.1 literal.
+func TestRedirectHostBindsWhatItAdvertises(t *testing.T) {
+	for _, host := range []string{"127.0.0.1", "localhost", ""} {
+		ln, uri, err := bindLoopback(host)
+		if err != nil {
+			t.Fatalf("bindLoopback(%q): %v", host, err)
+		}
+
+		// Reach the listener through the URI it advertised, which is what the
+		// browser does. If the two disagree, this is the connection refused a
+		// real login would hit.
+		u, perr := url.Parse(uri)
+		if perr != nil {
+			ln.Close()
+			t.Fatalf("bindLoopback(%q) produced an unparseable URI %q", host, uri)
+		}
+		conn, derr := net.DialTimeout("tcp", u.Host, 2*time.Second)
+		if derr != nil {
+			ln.Close()
+			t.Fatalf("redirect URI %s is not reachable at the bound listener: %v", uri, derr)
+		}
+		conn.Close()
+		ln.Close()
+
+		want := host
+		if want == "" {
+			want = "127.0.0.1" // the documented default
+		}
+		if u.Hostname() != want {
+			t.Errorf("bindLoopback(%q) advertised host %q, want %q", host, u.Hostname(), want)
+		}
+		if u.Path != "/callback" {
+			t.Errorf("redirect path = %q, want /callback", u.Path)
+		}
+	}
+}
+
+// Two concurrent logins must not be handed the same port.
+func TestBindLoopbackPortsAreDistinct(t *testing.T) {
+	a, uriA, err := bindLoopback("127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, uriB, err := bindLoopback("127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if uriA == uriB {
+		t.Errorf("two listeners share the redirect URI %s", uriA)
+	}
+}
 
 func TestCoerce(t *testing.T) {
 	cases := []struct {

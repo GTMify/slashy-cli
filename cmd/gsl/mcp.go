@@ -131,7 +131,7 @@ func (c *client) dial(ctx context.Context) error {
 
 // rpc issues one JSON-RPC call with a single refresh-and-retry on 401.
 func (c *client) rpc(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	res, status, err := c.do(ctx, method, params, false)
+	res, status, err := c.do(ctx, method, params)
 	if status == http.StatusUnauthorized {
 		c.mu.Lock()
 		alreadyTried := c.refreshed
@@ -144,8 +144,19 @@ func (c *client) rpc(ctx context.Context, method string, params any) (json.RawMe
 		if rerr := refresh(ctx, c.creds); rerr != nil {
 			return nil, rerr
 		}
-		c.sessionID = "" // a refreshed identity starts a new session
-		res, status, err = c.do(ctx, method, params, true)
+		// A refreshed identity starts a new session, so the handshake has to run
+		// again before the retry. Clearing the session id alone is not enough:
+		// the retry would go out with no Mcp-Session-Id while still claiming to
+		// be initialized, and a stateful server answers 400. That would break
+		// the recovery path at the one moment it is needed.
+		c.sessionID = ""
+		if method != "initialize" { // dial() issues initialize itself; do not recurse
+			c.inited = false
+			if derr := c.dial(ctx); derr != nil {
+				return nil, derr
+			}
+		}
+		res, status, err = c.do(ctx, method, params)
 		if status == http.StatusUnauthorized {
 			return nil, errNeedsLogin{reason: "still unauthorized after refreshing the token"}
 		}
@@ -171,7 +182,7 @@ func (c *client) notify(ctx context.Context, method string, params any) error {
 	return nil
 }
 
-func (c *client) do(ctx context.Context, method string, params any, isRetry bool) (json.RawMessage, int, error) {
+func (c *client) do(ctx context.Context, method string, params any) (json.RawMessage, int, error) {
 	c.mu.Lock()
 	id := c.nextID
 	c.nextID++

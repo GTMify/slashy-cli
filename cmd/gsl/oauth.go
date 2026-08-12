@@ -228,15 +228,11 @@ func login(ctx context.Context, openBrowser bool, redirectHost string) (*credent
 		redirectHost = "127.0.0.1"
 	}
 
-	// Bind the loopback listener FIRST. Registering a redirect URI for a port we
-	// do not hold produces a login that dies at the redirect with no useful error.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, redirectURI, err := bindLoopback(redirectHost)
 	if err != nil {
-		return nil, fmt.Errorf("bind loopback listener for OAuth redirect: %w", err)
+		return nil, err
 	}
 	defer ln.Close()
-	port := ln.Addr().(*net.TCPAddr).Port
-	redirectURI := fmt.Sprintf("http://%s:%d/callback", redirectHost, port)
 
 	clientID, err := registerClient(ctx, asm.RegistrationEndpoint, redirectURI)
 	if err != nil {
@@ -321,6 +317,30 @@ func login(ctx context.Context, openBrowser bool, redirectHost string) (*credent
 		return nil, err
 	}
 	return c, nil
+}
+
+// bindLoopback opens the callback listener and returns it with the matching
+// redirect URI. Two things are deliberate and both are load-bearing:
+//
+// The listener is bound BEFORE client registration, so the redirect URI we
+// register is a port we actually hold. Registering a port that turns out to be
+// taken produces a login that dies at the redirect with no useful error.
+//
+// It binds the SAME host that goes into the URI. Binding 127.0.0.1 while
+// redirecting to "localhost" fails on macOS, where localhost resolves to ::1
+// first, so the browser would land on a port nothing is listening on. That
+// matters because "localhost" is the documented workaround for servers whose
+// WAF rejects the 127.0.0.1 literal.
+func bindLoopback(redirectHost string) (net.Listener, string, error) {
+	if redirectHost == "" {
+		redirectHost = "127.0.0.1"
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(redirectHost, "0"))
+	if err != nil {
+		return nil, "", fmt.Errorf("bind %s for the OAuth redirect: %w", redirectHost, err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	return ln, fmt.Sprintf("http://%s:%d/callback", redirectHost, port), nil
 }
 
 func callbackHandler(wantState string, codeCh chan<- string, errCh chan<- error) http.Handler {
